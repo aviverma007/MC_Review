@@ -8,7 +8,7 @@ import { useToast } from '../context/ToastContext';
 // set (seeded account or admin reset) — no Cancel, no current-password
 // field, since the just-used login password IS the current one.
 export default function ChangePasswordModal({ forced, onClose }) {
-  const { user, logout } = useApp();
+  const { user, logout, refreshUser } = useApp();
   const { push } = useToast();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -24,6 +24,7 @@ export default function ChangePasswordModal({ forced, onClose }) {
     try {
       await api.changePassword(forced ? undefined : currentPassword, newPassword);
       push('Password changed');
+      if (forced) await refreshUser(); // clears mustChangePassword -> app unblocks
       onClose?.();
     } catch (e) {
       setError(e.response?.data?.error || 'Failed to change password');

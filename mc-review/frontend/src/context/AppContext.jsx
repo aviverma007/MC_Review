@@ -43,10 +43,15 @@ export function AppProvider({ children }) {
     api.reference().then(setReference).catch(() => {});
   }, [user]);
 
+  // Re-read the account (after a password change, role change, etc.).
+  const refreshUser = useCallback(async () => {
+    try { const u = await api.authMe(); setUser(u); return u; } catch { return null; }
+  }, []);
+
   const role = user?.role || null;
 
   const value = {
-    token, user, authLoading, login, logout,
+    token, user, authLoading, login, logout, refreshUser, setUser,
     role, roleLabel: role ? ROLE_LABEL[role] : null, ROLE_LABEL,
     reference,
     isReviewerish: role !== 'user',

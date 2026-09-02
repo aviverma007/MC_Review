@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
 import api from '../api';
@@ -22,37 +22,58 @@ export default function Page2() {
   const [date, setDate] = useState(today);
   const [sheet, setSheet] = useState(null);
   const [entries, setEntries] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showMigrate, setShowMigrate] = useState(false);
+  const loadSeq = useRef(0);
 
   const viewOnly = role === 'user';
   const canAct = isAdmin || (role === 'revMEP' && index === 'MEP') || (role === 'revCIV' && index === 'CIVIL');
   const admin = isAdmin;
   const cols = admin ? 24 : 23;
 
-  async function load() {
-    setLoading(true);
+  // The table stays mounted while data refreshes (the previous version
+  // swapped it for "Loading…" on every click, which destroyed the cell being
+  // edited and made the page feel frozen).
+  const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    setRefreshing(true);
     try {
       const data = await api.getSheet(index, date);
+      if (seq !== loadSeq.current) return;
       setSheet(data.sheet);
       setEntries(data.entries);
     } catch (e) { push(e.response?.data?.error || 'Failed to load sheet', 'error'); }
-    finally { setLoading(false); }
-  }
+    finally { if (seq === loadSeq.current) { setRefreshing(false); setInitialLoading(false); } }
+  }, [index, date]);
 
-  useEffect(() => { load(); }, [index, date]);
+  useEffect(() => { setInitialLoading(true); load(); }, [load]);
+
+  const patchEntry = useCallback((entry) => {
+    if (!entry) return;
+    setEntries((cur) => cur.map((x) => (x.id === entry.id ? { ...x, ...entry } : x)));
+  }, []);
 
   async function togglePresent(e) {
+    const next = !e.mc;
+    patchEntry({ ...e, mc: next }); // optimistic
     try {
-      const res = await api.setPresentToMc(index, date, e.id, !e.mc);
-      if (res.data.unlocked) push('Sheet unlocked — Page 3 continues to show the last locked version', 'warn');
-      load();
-    } catch (err) { push(err.response?.data?.error || 'Failed', 'error'); }
+      const res = await api.setPresentToMc(index, date, e.id, next);
+      if (res.data.unlocked) {
+        push('Sheet unlocked — Page 3 continues to show the last locked version', 'warn');
+        setSheet((s) => (s ? { ...s, locked: false } : s));
+      }
+    } catch (err) {
+      patchEntry({ ...e, mc: !next });
+      push(err.response?.data?.error || 'Failed', 'error');
+    }
   }
 
   async function touch(e, field, value) {
-    try { await api.touchCell(index, date, e.id, field, value); load(); }
-    catch (err) { push(err.response?.data?.error || 'Failed', 'error'); }
+    try {
+      const res = await api.touchCell(index, date, e.id, field, value);
+      patchEntry(res.data.entry);
+    } catch (err) { push(err.response?.data?.error || 'Failed', 'error'); load(); }
   }
 
   async function doLock() {
@@ -91,10 +112,11 @@ export default function Page2() {
           </div>
           <div className="field">
             <label>Sheet Date</label>
-            <input type="date" className="inp" value={date} min={today} onChange={(e) => setDate(e.target.value)} />
+            <input type="date" className="inp" value={date} min={today} onChange={(e) => e.target.value && setDate(e.target.value)} />
           </div>
           <span className="counter"><b>{selCount} selected</b> of {entries.length} submitted</span>
           <span className={`lockstate ${sheet?.locked ? 'locked' : ''}`}>{lockStateLabel}</span>
+          {refreshing && !initialLoading && <span className="refreshing">refreshing…</span>}
           <div className="spacer" />
           {viewOnly ? (
             <span className="viewbadge">VIEW-ONLY — reviewer curates &amp; locks this sheet</span>
@@ -110,7 +132,7 @@ export default function Page2() {
           )}
         </div>
 
-        {loading ? <div className="empty">Loading…</div> : entries.length === 0 ? (
+        {initialLoading ? <div className="empty">Loading…</div> : entries.length === 0 ? (
           <div className="empty">No submitted entries for this index + date yet.</div>
         ) : (
           <div className="tablewrap">
@@ -179,17 +201,30 @@ function FragmentGroup({ wt, label, colSpan, children }) {
   );
 }
 
+// Controlled cell editor. A textarea (not contentEditable — React re-renders
+// fought with the browser's edits and dropped keystrokes/focus). Saves on
+// blur or Enter, and only when the text actually changed.
 function EditableCell({ value, canEdit, isUser, onSave }) {
-  const [val, setVal] = useState(value || '');
+  const server = value ?? '';
+  const [val, setVal] = useState(server);
+  const [editing, setEditing] = useState(false);
+  useEffect(() => { if (!editing) setVal(server); }, [server, editing]);
+
+  function commit() {
+    setEditing(false);
+    if (val !== server) onSave(val);
+  }
   return (
     <td className={isUser ? 'edit' : ''}>
       {canEdit ? (
-        <div className="cellinput" contentEditable suppressContentEditableWarning
-          onBlur={(ev) => onSave(ev.target.textContent)}>
-          {isUser && <span className="redstar">*</span>}{value}
-        </div>
+        <textarea className="cellinput" value={val} rows={1}
+          onFocus={() => setEditing(true)}
+          onChange={(ev) => setVal(ev.target.value)}
+          onBlur={commit}
+          onKeyDown={(ev) => { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); ev.currentTarget.blur(); } if (ev.key === 'Escape') { setVal(server); setEditing(false); ev.currentTarget.blur(); } }}
+          title={isUser ? 'Edited value (yellow) — click to touch-up' : 'Click to touch-up in place'} />
       ) : (
-        <>{isUser && <span className="redstar">*</span>}{value}</>
+        <>{isUser && <span className="redstar">*</span>}{server || '—'}</>
       )}
     </td>
   );
@@ -199,7 +234,7 @@ function SelectCell({ value, options, canEdit, onSave }) {
   if (!canEdit) return <td>{value || '—'}</td>;
   return (
     <td>
-      <select className="inp sm" defaultValue={value || ''} onChange={(e) => onSave(e.target.value)}>
+      <select className="inp sm" value={value || ''} onChange={(e) => onSave(e.target.value)}>
         <option value="">—</option>
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
@@ -211,9 +246,8 @@ function Page2Row({ entry: e, sno, admin, canEdit, viewOnly, publishedRev, onTog
   const dim = !e.mc;
   const flagged = e.resubReq;
 
-  const prBudget = e.hyb?.prBudget ? (e.hyb.prBudget.pfn ? e.hyb.prBudget.qms : (e.hyb.prBudget.user ?? e.hyb.prBudget.qms)) : e.f?.prBudget;
-  const reason = e.hyb?.reason ? (e.hyb.reason.pfn ? e.hyb.reason.qms : (e.hyb.reason.user ?? e.hyb.reason.qms)) : e.f?.reason;
-  const vendPQ = e.hyb?.vendPQ ? (e.hyb.vendPQ.pfn ? e.hyb.vendPQ.qms : (e.hyb.vendPQ.user ?? e.hyb.vendPQ.qms)) : e.f?.vendPQ;
+  // e.f is already resolved server-side (QMS + Page-1 overrides + touch-ups)
+  const isUser = (field) => !!(e.userEdited?.[field] || e.touch?.[field]);
   const revised = revisedValLocal(e.f);
 
   return (
@@ -223,19 +257,19 @@ function Page2Row({ entry: e, sno, admin, canEdit, viewOnly, publishedRev, onTog
       <td className="nfa">{e.nfa}{e.initDt && <div className="sub">(Initiated on {fmtDMY(e.initDt)})</div>}</td>
       <td>{e.f?.project}</td>
       <td>{e.f?.location}</td>
-      <td>{e.initiator}{e.initiator !== e.enteredBy && <b className="redstar" title={`Proxy — entered by ${e.enteredBy}`}>*</b>}</td>
+      <td>{e.initiator}{e.isProxy && <b className="redstar" title={`Proxy — entered by ${e.enteredBy}`}>*</b>}</td>
       <SelectCell value={e.f?.initBy} options={reference?.initiatedByOptions || []} canEdit={canEdit} onSave={(v) => onTouch('initBy', v)} />
       <td>{e.f?.desc}</td>
       <td>{e.f?.duration || '—'}</td>
       <td>{e.f?.vendor}</td>
-      <EditableCell value={prBudget} canEdit={canEdit} isUser={e.hyb?.prBudget && !e.hyb.prBudget.pfn} onSave={(v) => onTouch('prBudget', v)} />
+      <EditableCell value={e.f?.prBudget} canEdit={canEdit} isUser={isUser('prBudget')} onSave={(v) => onTouch('prBudget', v)} />
       <td><b>{e.f?.val}</b></td>
       <td>{e.f?.lastAmd}</td>
       <td>{e.f?.variation}</td>
       <td><b>{revised}</b></td>
-      <EditableCell value={reason} canEdit={canEdit} isUser={e.hyb?.reason && !e.hyb.reason.pfn} onSave={(v) => onTouch('reason', v)} />
+      <EditableCell value={e.f?.reason} canEdit={canEdit} isUser={isUser('reason')} onSave={(v) => onTouch('reason', v)} />
       <SelectCell value={e.f?.rateVal} options={reference?.rateValidations || []} canEdit={canEdit} onSave={(v) => onTouch('rateVal', v)} />
-      <EditableCell value={vendPQ} canEdit={canEdit} isUser={e.hyb?.vendPQ && !e.hyb.vendPQ.pfn} onSave={(v) => onTouch('vendPQ', v)} />
+      <EditableCell value={e.f?.vendPQ} canEdit={canEdit} isUser={isUser('vendPQ')} onSave={(v) => onTouch('vendPQ', v)} />
       <td>{e.f?.pendWith || '—'}</td>
       <EditableCell value={e.resubComment} canEdit={canEdit} isUser={!!e.resubComment} onSave={(v) => onTouch('resubComment', v)} />
       {admin && <td>{e.enteredBy}</td>}

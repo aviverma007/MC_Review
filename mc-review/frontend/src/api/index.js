@@ -13,7 +13,12 @@ export const api = {
 
   // Reference & users
   reference: () => client.get('/reference').then((r) => r.data),
-  allNfas: (limit, offset) => client.get('/qms/all-nfas', { params: { limit, offset } }).then((r) => r.data),
+  // QMS mirror (full feed history, server-side search + paging)
+  allNfas: ({ q = '', limit = 100, offset = 0, nfaOnly = false } = {}) =>
+    client.get('/qms/all-nfas', { params: { q, limit, offset, nfaOnly: nfaOnly ? 1 : 0 } }).then((r) => r.data),
+  qmsRecord: (nfa) => client.get(`/qms/nfa/${encodeURIComponent(nfa)}`).then((r) => r.data),
+  qmsStatus: () => client.get('/qms/status').then((r) => r.data),
+  qmsSync: (mode) => client.post('/qms/sync', { mode }).then((r) => r.data),
   users: () => client.get('/users').then((r) => r.data),
   me: () => client.get('/users/me').then((r) => r.data),
   audit: () => client.get('/audit').then((r) => r.data),
@@ -69,9 +74,14 @@ export const api = {
   ordersConfig: () => client.get('/orders/config').then((r) => r.data),
   setMaxOrders: (value) => client.post('/orders/config/max-orders', { value }),
 
-  // PDFs
+  // PDFs — the route is behind the Bearer token, so the document is fetched
+  // as a blob (see utils/pdf.js); a plain <a href> in a new tab gets a 401.
   publishedPdfs: () => client.get('/pdf').then((r) => r.data),
   pdfUrl: (index, date) => `${API_BASE}/pdf/${index}/${date}`,
+  pdfBlob: (index, date, opts = {}) => client.get(`/pdf/${index}/${date}`, {
+    responseType: 'blob', timeout: 120000, params: opts.rev ? { rev: opts.rev } : {},
+  }),
+  regeneratePdf: (index, date) => client.post(`/pdf/${index}/${date}/regenerate`).then((r) => r.data),
 };
 
 export default api;

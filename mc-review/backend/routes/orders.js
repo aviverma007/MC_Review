@@ -2,6 +2,7 @@ const express = require('express');
 const sql = require('mssql');
 const { currentUser, audit } = require('../lib/auth');
 const { mmyyFromISO, todayISO } = require('../lib/reference');
+const { resolveFields } = require('../lib/fields');
 
 /**
  * Page 4 — Order Numbering. Implements the P4 Order-Number Syntax doc v1.0
@@ -239,7 +240,7 @@ module.exports = function ordersRoutes(getPool) {
     const { loginId, role } = currentUser(req);
     try {
       const pool = await getPool();
-      let entryQuery = `SELECT e.Id, e.NfaNo, e.IndexName, e.WorkType, e.ReviewDate, e.FieldsJson, e.UpdatedAt
+      let entryQuery = `SELECT e.Id, e.NfaNo, e.IndexName, e.WorkType, e.ReviewDate, e.FieldsJson, e.HybridJson, e.UpdatedAt
                          FROM dbo.MC_Entries e WHERE e.Status='approved'`;
       const request = pool.request();
       if (role === 'user') { entryQuery += ' AND (e.EnteredBy=@who OR e.InitiatedBy=@who)'; request.input('who', loginId); }
@@ -262,7 +263,7 @@ module.exports = function ordersRoutes(getPool) {
       ordersR.recordset.forEach((o) => { (ordersByNfa[o.NfaNo] = ordersByNfa[o.NfaNo] || []).push(o); });
 
       const result = entriesR.recordset.map((e) => {
-        const f = JSON.parse(e.FieldsJson || '{}');
+        const f = resolveFields(e);
         return {
           nfa: e.NfaNo,
           index: e.IndexName,

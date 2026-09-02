@@ -153,3 +153,28 @@ td.edit { background: #FFFDF3; }
 .usermenu { position: absolute; top: 100%; right: 0; margin-top: 4px; background: #fff; border: 1px solid #C4CAD2; border-radius: 4px; box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 70; min-width: 150px; overflow: hidden; }
 .usermenu button { display: block; width: 100%; text-align: left; padding: 9px 12px; border: none; background: none; font-size: 12px; cursor: pointer; }
 .usermenu button:hover { background: #F0F1F4; }
+
+/* ---- added: in-place editing, PDF cards, QMS browser ---- */
+textarea.cellinput {
+  display: block; width: 100%; min-width: 90px; min-height: 18px; resize: vertical;
+  border: 1px solid transparent; border-radius: 2px; padding: 1px 3px; margin: 0;
+  font: inherit; line-height: 1.3; background: transparent; color: inherit; outline: none;
+  field-sizing: content;
+}
+textarea.cellinput:hover { border-color: #C4CAD2; }
+textarea.cellinput:focus { background: #FFFDF3; border-color: #9A6700; }
+.refreshing { font-size: 10px; color: #666; font-style: italic; margin-left: 8px; }
+.expando { font-size: 9px; color: #888; margin-left: 2px; }
+.pdfbtns { display: inline-flex; gap: 4px; white-space: nowrap; }
+.pdfcard {
+  margin: 8px 0 10px; padding: 8px 10px; border: 1px solid #C9D7E6; border-left: 4px solid #0B6B3A;
+  background: #F4FAF6; border-radius: 3px; font-size: 11px;
+}
+.pdfcard .sub { margin-top: 3px; color: #555; }
+.qmscard {
+  padding: 8px 10px; border: 1px solid #D5D9DF; background: #FAFBFC; border-radius: 3px; font-size: 11px;
+  display: grid; gap: 3px; margin-bottom: 6px;
+}
+.qmscard b { color: #333; }
+.fval.userv { background: #FFF9DB; }
+.btn.sm { padding: 2px 7px; font-size: 10px; }

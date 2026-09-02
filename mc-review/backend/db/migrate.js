@@ -129,6 +129,9 @@ CREATE TABLE dbo.MC_SnapshotRows (
   RowOrder      INT NOT NULL DEFAULT(0)
 );
 
+IF COL_LENGTH('dbo.MC_SnapshotRows', 'FilesJson') IS NULL
+  ALTER TABLE dbo.MC_SnapshotRows ADD FilesJson NVARCHAR(MAX) NOT NULL DEFAULT('[]');
+
 IF OBJECT_ID('dbo.MC_PublishedPdfs','U') IS NULL
 CREATE TABLE dbo.MC_PublishedPdfs (
   Id            INT IDENTITY(1,1) PRIMARY KEY,
@@ -140,6 +143,71 @@ CREATE TABLE dbo.MC_PublishedPdfs (
   PublishedAt   DATETIME NOT NULL DEFAULT(GETDATE()),
   DecidedCount  INT NOT NULL DEFAULT(0),
   UndecidedNos  NVARCHAR(MAX) NULL -- JSON array of numbers-only undecided NFAs
+);
+-- The published PDF itself: generated ONCE at publish time, written to
+-- PDF_DIR on the server (FilePath) AND kept as bytes in the DB (PdfBytes)
+-- so the document survives a server move / disk loss. GET /api/pdf serves
+-- the file, falls back to the bytes, and only regenerates if both are gone.
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'FileName') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD FileName NVARCHAR(200) NULL;
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'FilePath') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD FilePath NVARCHAR(600) NULL;
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'PdfBytes') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD PdfBytes VARBINARY(MAX) NULL;
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'PdfSize') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD PdfSize INT NULL;
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'LockedVersion') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD LockedVersion INT NULL;
+IF COL_LENGTH('dbo.MC_PublishedPdfs', 'PdfGeneratedAt') IS NULL
+  ALTER TABLE dbo.MC_PublishedPdfs ADD PdfGeneratedAt DATETIME NULL;
+
+-- Local mirror of the QMS PR/NFA feed (lib/qmsSync.js). One row per NFA
+-- (latest amendment version wins) or per PR that has no NFA yet
+-- (RecKey = 'PR:'+EPR_No). Full history is synced once in month-sized
+-- chunks, then a rolling window is refreshed every few minutes, so
+-- lookups/searches never wait on the (slow, multi-MB) live feed.
+IF OBJECT_ID('dbo.MC_QmsNfa','U') IS NULL
+CREATE TABLE dbo.MC_QmsNfa (
+  RecKey        NVARCHAR(40)  NOT NULL PRIMARY KEY,
+  NfaNo         NVARCHAR(20)  NULL,   -- normalized (leading zeros stripped)
+  NfaNoRaw      NVARCHAR(20)  NULL,   -- as QMS pads it, e.g. 0000015144
+  PrNo          NVARCHAR(20)  NULL,   -- EPR_No
+  Version       NVARCHAR(4)   NULL,   -- ENFA_Version
+  Project       NVARCHAR(200) NULL,
+  Location      NVARCHAR(200) NULL,
+  Title         NVARCHAR(600) NULL,
+  Subject       NVARCHAR(MAX) NULL,
+  Vendor        NVARCHAR(1000) NULL,
+  BudgetLacs    NVARCHAR(30)  NULL,
+  BudgetNumeric DECIMAL(18,2) NULL,
+  Initiator     NVARCHAR(120) NULL,
+  PendingWith   NVARCHAR(200) NULL,
+  StatusDesc    NVARCHAR(80)  NULL,
+  Package       NVARCHAR(120) NULL,
+  InitiatedOn   DATE          NULL,   -- PRN_Date
+  NfaCreatedAt  DATETIME      NULL,   -- NFA_Created_Date
+  RawJson       NVARCHAR(MAX) NOT NULL,
+  SyncedAt      DATETIME      NOT NULL DEFAULT(GETDATE())
+);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_QmsNfa_NfaNo' AND object_id=OBJECT_ID('dbo.MC_QmsNfa'))
+  CREATE INDEX IX_MC_QmsNfa_NfaNo ON dbo.MC_QmsNfa(NfaNo);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_QmsNfa_PrNo' AND object_id=OBJECT_ID('dbo.MC_QmsNfa'))
+  CREATE INDEX IX_MC_QmsNfa_PrNo ON dbo.MC_QmsNfa(PrNo);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_QmsNfa_InitiatedOn' AND object_id=OBJECT_ID('dbo.MC_QmsNfa'))
+  CREATE INDEX IX_MC_QmsNfa_InitiatedOn ON dbo.MC_QmsNfa(InitiatedOn DESC, NfaCreatedAt DESC);
+
+IF OBJECT_ID('dbo.MC_QmsSyncLog','U') IS NULL
+CREATE TABLE dbo.MC_QmsSyncLog (
+  Id          INT IDENTITY(1,1) PRIMARY KEY,
+  Kind        NVARCHAR(20) NOT NULL,  -- full-chunk | incremental | manual
+  StartDate   DATE NOT NULL,
+  EndDate     DATE NOT NULL,
+  RowsFetched INT NULL,
+  RowsUpserted INT NULL,
+  Ok          BIT NOT NULL DEFAULT(0),
+  Error       NVARCHAR(1000) NULL,
+  StartedAt   DATETIME NOT NULL DEFAULT(GETDATE()),
+  FinishedAt  DATETIME NULL
 );
 
 IF OBJECT_ID('dbo.MC_OrderSeq','U') IS NULL
@@ -190,8 +258,32 @@ IF NOT EXISTS (SELECT 1 FROM dbo.MC_Config WHERE [Key]='retirementPolicy')
   -- pluggable so an admin-releasable mode can be switched on later
   -- WITHOUT a schema change, per the P4 syntax doc §4.
   INSERT INTO dbo.MC_Config([Key],[Value]) VALUES ('retirementPolicy','permanent');
+IF NOT EXISTS (SELECT 1 FROM dbo.MC_Config WHERE [Key]='qmsFullSyncDone')
+  INSERT INTO dbo.MC_Config([Key],[Value]) VALUES ('qmsFullSyncDone','0');
 IF NOT EXISTS (SELECT 1 FROM dbo.MC_Config WHERE [Key]='migrateWindowDays')
   INSERT INTO dbo.MC_Config([Key],[Value]) VALUES ('migrateWindowDays','10');
+
+-- Indexes for the queries Pages 1-4 run on every click.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_Entries_Nfa_Open' AND object_id=OBJECT_ID('dbo.MC_Entries'))
+  CREATE INDEX IX_MC_Entries_Nfa_Open ON dbo.MC_Entries(NfaNo, IsOpen) INCLUDE (Status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_Entries_Sheet' AND object_id=OBJECT_ID('dbo.MC_Entries'))
+  CREATE INDEX IX_MC_Entries_Sheet ON dbo.MC_Entries(IndexName, ReviewDate, Status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_Entries_EnteredBy' AND object_id=OBJECT_ID('dbo.MC_Entries'))
+  CREATE INDEX IX_MC_Entries_EnteredBy ON dbo.MC_Entries(EnteredBy, ReviewDate);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_Entries_InitiatedBy' AND object_id=OBJECT_ID('dbo.MC_Entries'))
+  CREATE INDEX IX_MC_Entries_InitiatedBy ON dbo.MC_Entries(InitiatedBy, ReviewDate);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_PendingMoves_Entry' AND object_id=OBJECT_ID('dbo.MC_PendingMoves'))
+  CREATE INDEX IX_MC_PendingMoves_Entry ON dbo.MC_PendingMoves(EntryId, Status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_SnapshotRows_Sheet' AND object_id=OBJECT_ID('dbo.MC_SnapshotRows'))
+  CREATE INDEX IX_MC_SnapshotRows_Sheet ON dbo.MC_SnapshotRows(SheetId, Version, WorkType, RowOrder);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_SnapshotRows_Nfa' AND object_id=OBJECT_ID('dbo.MC_SnapshotRows'))
+  CREATE INDEX IX_MC_SnapshotRows_Nfa ON dbo.MC_SnapshotRows(NfaNo);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_SnapshotRows_Entry' AND object_id=OBJECT_ID('dbo.MC_SnapshotRows'))
+  CREATE INDEX IX_MC_SnapshotRows_Entry ON dbo.MC_SnapshotRows(EntryId);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_OrderRegister_Nfa' AND object_id=OBJECT_ID('dbo.MC_OrderRegister'))
+  CREATE INDEX IX_MC_OrderRegister_Nfa ON dbo.MC_OrderRegister(NfaNo, Status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_PublishedPdfs_IdxDate' AND object_id=OBJECT_ID('dbo.MC_PublishedPdfs'))
+  CREATE INDEX IX_MC_PublishedPdfs_IdxDate ON dbo.MC_PublishedPdfs(IndexName, ReviewDate, Revision);
 
 IF OBJECT_ID('dbo.MC_AuditLog','U') IS NULL
 CREATE TABLE dbo.MC_AuditLog (
@@ -201,6 +293,8 @@ CREATE TABLE dbo.MC_AuditLog (
   Action    NVARCHAR(120) NOT NULL,
   Detail    NVARCHAR(1000) NULL
 );
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_MC_AuditLog_AtTime' AND object_id=OBJECT_ID('dbo.MC_AuditLog'))
+  CREATE INDEX IX_MC_AuditLog_AtTime ON dbo.MC_AuditLog(AtTime DESC);
   `);
 
   // Seed the 4 role credentials on first boot only (I4 — real AD/SSO is a

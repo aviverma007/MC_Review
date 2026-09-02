@@ -1,61 +1,26 @@
 /**
  * QMS adapter — read-only, one-way QMS -> Dashboard (Workflow v2.5 §1.1).
  *
- * Wired to the real live PR/NFA feed:
- *   https://smartworlddevelopersonline.com/SapPrNFATatReport.php
- *     ?startdate=YYYY-MM-DD&enddate=YYYY-MM-DD
+ * Reads come from the local SQL mirror (dbo.MC_QmsNfa, kept current by
+ * lib/qmsSync.js). That gives millisecond lookups over the ENTIRE feed
+ * history (not a 3-month window), and Fetch never blocks on the live feed.
  *
- * The window is a rolling last-3-months: startdate = today minus
- * LOOKBACK_MONTHS, enddate is always today's date on the server's own
- * clock (never a client-supplied value, per I10/F9). A full-history window
- * (originally 2025-01-01) was too large a payload and too slow to load, so
- * this was narrowed to 3 months — adjust LOOKBACK_MONTHS below if a wider
- * or narrower window is ever needed.
+ * If an NFA isn't in the mirror yet (created minutes ago), lookupNfa()
+ * triggers one quick refresh of the last 7 days and retries before
+ * answering "not found" — so a brand-new NFA still fetches without waiting
+ * for the next scheduled sync.
  *
- * The feed returns one JSON object per PR/NFA row with SAP-style field
- * names (NFA_No, NFA_Title, Vendor_Name, NFA_Budget, ...). This module
- * normalizes that shape into the field names the rest of the app expects
- * (project, desc, vendor, val, reason, ...) — see mapRecord() below. No
- * attached-file data is provided by this endpoint; `files` stays empty
- * until the QMS file-store/OData integration (a separate, still-pending
- * piece per the readiness doc's I1/I2/I3) is wired in.
- *
- * A short in-memory cache avoids re-fetching the (potentially large) feed
- * on every keystroke/request; call invalidateCache() if a manual refresh
- * is ever needed.
+ * Field mapping from the feed's SAP-style names to the dashboard's internal
+ * shape is mapRecord() — still the only place to change if the feed changes.
  */
+const sync = require('./qmsSync');
 
-const BASE_URL = 'https://smartworlddevelopersonline.com/SapPrNFATatReport.php';
-const LOOKBACK_MONTHS = 3; // rolling window — 2025-01-01 was too large a payload and too slow to load
-const CACHE_TTL_MS = 60 * 1000; // 60s — balances freshness against hammering the feed
+const { normalizeNfa, dmyToIso, combineVendors } = sync;
 
-let cache = { at: 0, byNfa: new Map() };
-
-function todayISO() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-// Rolling start date = today minus LOOKBACK_MONTHS, recomputed on every
-// cache refresh so the window always slides forward with "today".
-function startDateISO() {
-  const d = new Date();
-  d.setMonth(d.getMonth() - LOOKBACK_MONTHS);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-// Normalizes an NFA number for lookup: strips leading zeros so "0000014315"
-// and "14315" match the same record (QMS pads to 10 digits; the dashboard
-// and people type the short form).
-function normalizeNfa(nfa) {
-  return String(nfa || '').replace(/^0+/, '') || '0';
-}
-
-// "0000014315" -> "14315" for display; falls back to the raw value if it
-// doesn't look like a zero-padded numeric NFA.
+// "0000014315" -> "14315" for display.
 function displayNfa(rawNfaNo) {
   const n = normalizeNfa(rawNfaNo);
-  return /^\d+$/.test(n) ? n : rawNfaNo;
+  return /^\d+$/.test(n) ? n : (rawNfaNo || '');
 }
 
 // "0.80 Lacs" / "23.00 Lacs" -> "0.80" / "23.00"; leaves non-numeric as-is.
@@ -64,112 +29,106 @@ function lacsToNumberString(s) {
   const m = String(s).match(/-?[\d,]+\.?\d*/);
   return m ? m[0].replace(/,/g, '') : String(s).trim();
 }
-
-// DD/MM/YYYY -> YYYY-MM-DD (the feed's date fields use this format).
-function dmyToIso(s) {
-  if (!s) return null;
-  const m = String(s).match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (!m) return null;
-  return `${m[3]}-${m[2]}-${m[1]}`;
-}
-
-// Collapses Vendor_One..Vendor_Five into a single "1. X · 2. Y" string,
-// matching how the dashboard already displays multi-vendor NFAs.
-function combineVendors(rec) {
-  const names = [rec.Vendor_One, rec.Vendor_Two, rec.Vendor_Three, rec.Vendor_Four, rec.Vendor_Five]
-    .map((v) => (v || '').trim())
-    .filter((v) => v && v !== '0');
-  if (names.length === 0) return rec.Vendor_Name || '—';
-  if (names.length === 1) return names[0];
-  return names.map((n, i) => `${i + 1}. ${n}`).join(' · ');
+// Rupees "2142250" -> lacs "21.42"
+function rupeesToLacsString(s) {
+  const n = parseFloat(String(s || '').replace(/[^0-9.\-]/g, ''));
+  if (isNaN(n)) return null;
+  return (Math.round(n / 1000) / 100).toFixed(2);
 }
 
 function mapRecord(rec) {
+  const vendorCount = [rec.Vendor_One, rec.Vendor_Two, rec.Vendor_Three, rec.Vendor_Four, rec.Vendor_Five]
+    .filter((v) => v && String(v).trim() && String(v).trim() !== '0').length;
   return {
     project: rec.Project_Name || rec.NFA_Location || '—',
     location: rec.NFA_Location || rec.PR_Location || '—',
     desc: rec.NFA_Title || rec.Scope || '—',
     duration: rec.Contract_Duration || '—',
-    vendor: combineVendors(rec),
-    val: lacsToNumberString(rec.NFA_Budget),
+    vendor: combineVendors(rec) || '—',
+    // Original Order Value (incl. GST) = the NFA's recommended amount incl.
+    // tax; the NFA budget is the fallback when the feed hasn't got it yet.
+    val: lacsToNumberString(rec.Amount_Including_Tax || rec.NFA_Budget),
     lastAmd: 'NA', // not separately exposed by this feed; revisedVal() falls back to val
     variation: 'NA',
     reason: rec.Subject_Of_NFA || rec.Scope || '—',
     reasonability: rec.Rate_Recommendations || '—',
-    rateVal: rec.Vendor_Recommendations || '',
-    vendPQ: String([rec.Vendor_One, rec.Vendor_Two, rec.Vendor_Three, rec.Vendor_Four, rec.Vendor_Five]
-      .filter((v) => v && v.trim() && v.trim() !== '0').length || 1),
+    rateVal: '',
+    vendPQ: String(vendorCount || 1),
     pr: rec.EPR_No || '—',
     initDt: dmyToIso(rec.PRN_Date) || (rec.PR_Created_Date || '').slice(0, 10) || null,
     pendWith: rec.NFA_Pending_With || rec.PR_Pending_With || '—',
     initiator: rec.recomender_name || rec.cp_name || '—',
-    prBudget: lacsToNumberString(rec.NFA_Budget),
+    // PR Budget = the PR's own budget (rupees in the feed -> lacs); falls back
+    // to the NFA budget when the PR has none.
+    prBudget: rupeesToLacsString(rec.PR_Budget) || lacsToNumberString(rec.NFA_Budget),
+    nfaBudget: lacsToNumberString(rec.NFA_Budget),
     initBy: rec.PRH_Package || 'Site',
+    qmsStatus: rec.NFA_Status_Desc || '',
+    payTerms: rec.Payment_Terms || '',
     files: [], // real QMS file-store integration pending (I1/I2/I3)
   };
 }
 
-async function loadCache() {
-  const now = Date.now();
-  if (now - cache.at < CACHE_TTL_MS && cache.byNfa.size > 0) return cache.byNfa;
+function rowToRecord(row) {
+  let raw = {};
+  try { raw = JSON.parse(row.RawJson || '{}'); } catch { /* keep {} */ }
+  return {
+    nfa: row.NfaNo || '',
+    nfaRaw: row.NfaNoRaw || '',
+    prNo: row.PrNo || '',
+    qmsStatus: row.StatusDesc || '',
+    syncedAt: row.SyncedAt,
+    ...mapRecord(raw),
+  };
+}
 
-  const url = `${BASE_URL}?startdate=${startDateISO()}&enddate=${todayISO()}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000); // fail fast rather than hang the UI indefinitely
-  let res;
-  try {
-    res = await fetch(url, { signal: controller.signal });
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('QMS feed timed out after 20s — try again in a moment');
-    throw e;
-  } finally {
-    clearTimeout(timeout);
+/**
+ * Look up an NFA by number. Returns null if not found (Mode A validation
+ * #1 — "NFA not in QMS -> error + offer Mode B").
+ */
+async function lookupNfa(pool, nfaNo) {
+  const key = normalizeNfa(nfaNo);
+  if (!key) return null;
+  const q = () => pool.request().input('n', key)
+    .query('SELECT TOP 1 * FROM dbo.MC_QmsNfa WHERE NfaNo=@n ORDER BY NfaCreatedAt DESC');
+  let r = await q();
+  if (!r.recordset[0]) {
+    // Not mirrored yet — maybe it was created minutes ago. One quick
+    // refresh of the recent window, then look again.
+    const refreshed = await sync.quickRefresh(pool);
+    if (refreshed) r = await q();
   }
-  if (!res.ok) throw new Error(`QMS feed returned HTTP ${res.status}`);
-  const data = await res.json();
-  const rows = Array.isArray(data.results) ? data.results : [];
-
-  const byNfa = new Map();
-  rows.forEach((rec) => {
-    const key = normalizeNfa(rec.NFA_No);
-    // Later rows (feed order) win on duplicate NFA numbers — the feed can
-    // return the same NFA multiple times across amendment versions.
-    byNfa.set(key, rec);
-  });
-
-  cache = { at: now, byNfa };
-  return byNfa;
+  return r.recordset[0] ? rowToRecord(r.recordset[0]) : null;
 }
 
 /**
- * Look up an NFA in QMS. Returns null if not found (Mode A validation #1 —
- * "NFA not in QMS -> error + offer Mode B").
+ * Browse/search the whole mirrored feed. Server-side filter + paging so the
+ * Page-1 "All NFAs" tab never has to pull thousands of rows to the browser.
+ *   q        free text over NFA no / PR no / project / title / vendor / subject
+ *   nfaOnly  true = hide PRs that have no NFA yet
  */
-async function lookupNfa(nfaNo) {
-  const byNfa = await loadCache();
-  const rec = byNfa.get(normalizeNfa(nfaNo));
-  if (!rec) return null;
-  return mapRecord(rec);
+async function listAll(pool, { q = '', limit = 100, offset = 0, nfaOnly = false } = {}) {
+  const sql = require('mssql');
+  const where = [];
+  const req = pool.request();
+  const term = String(q || '').trim();
+  if (term) {
+    const norm = normalizeNfa(term);
+    req.input('q', sql.NVarChar(200), `%${term}%`);
+    req.input('qn', sql.NVarChar(20), norm || term);
+    where.push(`(NfaNo=@qn OR PrNo=@qn OR NfaNo LIKE @q OR PrNo LIKE @q OR Project LIKE @q OR Title LIKE @q OR Vendor LIKE @q OR Subject LIKE @q OR Initiator LIKE @q)`);
+  }
+  if (nfaOnly) where.push('NfaNo IS NOT NULL');
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  req.input('limit', sql.Int, Math.max(1, Math.min(Number(limit) || 100, 2000)));
+  req.input('offset', sql.Int, Math.max(0, Number(offset) || 0));
+  const r = await req.query(`
+    SELECT COUNT(*) OVER() AS TotalCount, *
+    FROM dbo.MC_QmsNfa ${whereSql}
+    ORDER BY InitiatedOn DESC, NfaCreatedAt DESC, RecKey DESC
+    OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`);
+  const total = r.recordset[0]?.TotalCount ?? 0;
+  return { total, rows: r.recordset.map(rowToRecord) };
 }
 
-/**
- * List every NFA currently in the feed's result window, mapped to the same
- * shape as lookupNfa() plus the display-friendly NFA number. Backs the
- * Page-1 "All NFAs" browse tab.
- */
-async function listAll() {
-  const byNfa = await loadCache();
-  const out = [];
-  byNfa.forEach((rec, key) => {
-    out.push({ nfa: displayNfa(rec.NFA_No), ...mapRecord(rec) });
-  });
-  // Most-recently-initiated first, matching the feed's own ordering intent.
-  out.sort((a, b) => (b.initDt || '').localeCompare(a.initDt || ''));
-  return out;
-}
-
-function invalidateCache() {
-  cache = { at: 0, byNfa: new Map() };
-}
-
-module.exports = { lookupNfa, listAll, invalidateCache, mapRecord, normalizeNfa, displayNfa };
+module.exports = { lookupNfa, listAll, mapRecord, normalizeNfa, displayNfa, rowToRecord };

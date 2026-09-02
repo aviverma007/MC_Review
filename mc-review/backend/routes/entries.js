@@ -5,7 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const { currentUser, audit } = require('../lib/auth');
 const { lookupNfa } = require('../lib/qmsAdapter');
-const { todayISO, revisedVal } = require('../lib/reference');
+const { todayISO } = require('../lib/reference');
+const { rowToEntry, mergeRepull, parse } = require('../lib/fields');
 
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -55,32 +56,6 @@ module.exports = function entriesRoutes(getPool) {
     };
   }
 
-  function rowToEntry(row) {
-    return {
-      id: row.Id,
-      nfa: row.NfaNo,
-      mode: row.Mode,
-      index: row.IndexName,
-      wt: row.WorkType,
-      date: row.ReviewDate.toISOString().slice(0, 10),
-      f: JSON.parse(row.FieldsJson || '{}'),
-      hyb: JSON.parse(row.HybridJson || '{}'),
-      touch: JSON.parse(row.TouchJson || '{}'),
-      files: JSON.parse(row.FilesJson || '[]'),
-      initiator: row.InitiatedBy,
-      isProxy: !!row.IsProxy,
-      initDt: row.InitiatedOn ? row.InitiatedOn.toISOString().slice(0, 10) : null,
-      enteredBy: row.EnteredBy,
-      interimRef: row.InterimRef,
-      status: row.Status,
-      sel: !!row.Selected,
-      mc: !!row.PresentToMC,
-      resubReq: !!row.ResubRequired,
-      resubComment: row.ResubComment,
-      isOpen: !!row.IsOpen,
-    };
-  }
-
   async function getEntryRow(pool, id) {
     const r = await pool.request().input('id', id).query('SELECT * FROM dbo.MC_Entries WHERE Id=@id');
     return r.recordset[0] || null;
@@ -125,7 +100,8 @@ module.exports = function entriesRoutes(getPool) {
       await pool.request().input('id', id).input('files', JSON.stringify(merged))
         .query('UPDATE dbo.MC_Entries SET FilesJson=@files, UpdatedAt=GETDATE() WHERE Id=@id');
       await audit(pool, loginId, 'File upload', `${row.NfaNo}: ${added.map((f) => f.n).join(', ')}`);
-      res.json({ ok: true, added });
+      const updated = await getEntryRow(pool, id);
+      res.json({ ok: true, added, entry: rowToEntry(updated) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -162,6 +138,9 @@ module.exports = function entriesRoutes(getPool) {
   router.get('/', async (req, res) => {
     const { loginId, role } = currentUser(req);
     const dateView = req.query.dateView || 'today';
+    if (dateView !== 'today' && !/^\d{4}-\d{2}-\d{2}$/.test(dateView)) {
+      return res.status(400).json({ error: 'dateView must be "today" or YYYY-MM-DD' });
+    }
     try {
       const pool = await getPool();
       const today = todayISO();
@@ -204,16 +183,23 @@ module.exports = function entriesRoutes(getPool) {
 
   // ---- Fetch from QMS (Mode A: create OR re-pull OR stage pending-move) --
   router.post('/fetch', async (req, res) => {
-    const { loginId } = currentUser(req);
-    const { nfa, index, wt, date } = req.body;
+    const { loginId, displayName } = currentUser(req);
+    const { index, wt, date } = req.body;
+    // Accept "14315", "0000014315", " 14315 " — the mirror is keyed on the
+    // leading-zero-stripped form, and entries are stored the same way.
+    const nfa = String(req.body.nfa || '').trim().replace(/^0+/, '');
     if (!nfa || !index || !wt || !date) return res.status(400).json({ error: 'nfa, index, wt, date are required' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    if (date < todayISO()) return res.status(400).json({ error: 'Review date must be today or a future date' });
 
     try {
       const pool = await getPool();
-      const qmsRec = await lookupNfa(nfa);
+      const qmsRec = await lookupNfa(pool, nfa);
       if (!qmsRec) {
-        return res.status(404).json({ error: 'NFA not found in QMS', offerModeB: true });
+        return res.status(404).json({ error: 'NFA not found in QMS (checked the full mirrored history and refreshed the recent window)', offerModeB: true });
       }
+      const norm = (x) => String(x || '').trim().toLowerCase();
+      const isProxy = norm(qmsRec.initiator) !== norm(displayName) && norm(qmsRec.initiator) !== norm(loginId) ? 1 : 0;
 
       const targetSheet = await getSheet(pool, index, date);
       if (targetSheet.PublishedRev > 0) {
@@ -235,7 +221,7 @@ module.exports = function entriesRoutes(getPool) {
           .input('nfa', nfa).input('mode', 'A').input('idx', index).input('wt', wt).input('d', date)
           .input('fields', JSON.stringify(fields)).input('hyb', JSON.stringify(hyb))
           .input('files', JSON.stringify(allFiles))
-          .input('initiator', qmsRec.initiator).input('isProxy', qmsRec.initiator !== loginId ? 1 : 0)
+          .input('initiator', qmsRec.initiator).input('isProxy', isProxy)
           .input('initDt', qmsRec.initDt).input('enteredBy', loginId)
           .input('resubReq', resubReq ? 1 : 0)
           .query(`INSERT INTO dbo.MC_Entries
@@ -266,14 +252,18 @@ module.exports = function entriesRoutes(getPool) {
 
         const onLockedSheet = targetSheet.Locked;
         const newStatus = onLockedSheet ? 'submitted' : open.Status;
-        const newSelected = onLockedSheet ? 0 : (open.Status === 'draft' ? 0 : open.Selected);
+        const newSelected = open.Selected;
+        const newMc = onLockedSheet ? 0 : open.PresentToMC;
 
+        // D9: QMS values refresh, but nothing a person typed is lost.
+        const merged = mergeRepull(open, qmsRec, hybridInit);
         await pool.request().input('id', open.Id)
-          .input('fields', JSON.stringify(qmsRec))
+          .input('fields', JSON.stringify(merged.fields))
+          .input('hyb', JSON.stringify(merged.hyb))
           .input('files', JSON.stringify(mergedFiles))
-          .input('status', newStatus).input('selected', newSelected)
-          .query(`UPDATE dbo.MC_Entries SET FieldsJson=@fields, FilesJson=@files,
-                    Status=@status, Selected=@selected, UpdatedAt=GETDATE() WHERE Id=@id`);
+          .input('status', newStatus).input('selected', newSelected).input('mc', newMc)
+          .query(`UPDATE dbo.MC_Entries SET FieldsJson=@fields, HybridJson=@hyb, FilesJson=@files,
+                    Status=@status, Selected=@selected, PresentToMC=@mc, UpdatedAt=GETDATE() WHERE Id=@id`);
 
         await pool.request().input('id', open.Id)
           .query(`UPDATE dbo.MC_PendingMoves SET Status='cancelled' WHERE EntryId=@id AND Status='pending'`);
@@ -294,11 +284,12 @@ module.exports = function entriesRoutes(getPool) {
       await pool.request().input('id', open.Id)
         .query(`UPDATE dbo.MC_PendingMoves SET Status='cancelled' WHERE EntryId=@id AND Status='pending'`);
 
+      const stagedMerge = mergeRepull(open, qmsRec, hybridInit);
       await pool.request()
         .input('entryId', open.Id)
         .input('fromIdx', open.IndexName).input('fromDate', open.ReviewDate)
         .input('toIdx', index).input('toWt', wt).input('toDate', date)
-        .input('fields', JSON.stringify(qmsRec))
+        .input('fields', JSON.stringify(stagedMerge.fields))
         .input('files', JSON.stringify(qmsRec.files.map((f) => ({ ...f, src: 'qms' }))))
         .query(`INSERT INTO dbo.MC_PendingMoves
                   (EntryId, FromIndexName, FromReviewDate, ToIndexName, ToWorkType, ToReviewDate, FieldsJson, FilesJson)
@@ -363,7 +354,7 @@ module.exports = function entriesRoutes(getPool) {
       const pool = await getPool();
       await pool.request().input('id', req.params.id).input('sel', selected ? 1 : 0)
         .query('UPDATE dbo.MC_Entries SET Selected=@sel, UpdatedAt=GETDATE() WHERE Id=@id');
-      res.json({ ok: true });
+      res.json({ ok: true, selected: !!selected });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -441,9 +432,9 @@ module.exports = function entriesRoutes(getPool) {
         const wasPresented = open.Status === 'presented';
         await pool.request().input('id', pm.Id).query(`UPDATE dbo.MC_PendingMoves SET Status='applied' WHERE Id=@id`);
         await pool.request().input('id', id).input('idx', pm.ToIndexName).input('wt', pm.ToWorkType).input('d', toDateISO)
-          .input('fields', pm.FieldsJson).input('files', pm.FilesJson)
+          .input('fields', pm.FieldsJson).input('files', pm.FilesJson).input('mc', toSheet.Locked ? 0 : 1)
           .query(`UPDATE dbo.MC_Entries SET IndexName=@idx, WorkType=@wt, ReviewDate=@d, FieldsJson=@fields,
-                    FilesJson=@files, Status='submitted', Selected=0, UpdatedAt=GETDATE() WHERE Id=@id`);
+                    FilesJson=@files, Status='submitted', Selected=1, PresentToMC=@mc, UpdatedAt=GETDATE() WHERE Id=@id`);
 
         if (wasPresented) {
           await pool.request().input('entryId', id).input('idx1', open.IndexName).input('d1', open.ReviewDate)
@@ -471,8 +462,10 @@ module.exports = function entriesRoutes(getPool) {
       }
 
       const landsDeselected = targetSheet.Locked;
-      await pool.request().input('id', id).input('status', 'submitted').input('sel', landsDeselected ? 0 : 1)
-        .query(`UPDATE dbo.MC_Entries SET Status=@status, Selected=@sel, UpdatedAt=GETDATE() WHERE Id=@id`);
+      // P1 checkbox stays ticked (that's what "submitted" means on Page 1);
+      // the Page-2 "Present to MC" tick lands on unless the sheet is locked.
+      await pool.request().input('id', id).input('status', 'submitted').input('mc', landsDeselected ? 0 : 1)
+        .query(`UPDATE dbo.MC_Entries SET Status=@status, Selected=1, PresentToMC=@mc, UpdatedAt=GETDATE() WHERE Id=@id`);
       await audit(pool, loginId, 'Entry submitted', `${open.NfaNo} -> Page 2 (${sheetDate})${landsDeselected ? ' [locked sheet: auto-deselected]' : ''}`);
       const row = await getEntryRow(pool, id);
       res.json({ submitted: true, autoDeselected: !!landsDeselected, entry: rowToEntry(row) });
@@ -493,7 +486,9 @@ module.exports = function entriesRoutes(getPool) {
       if (typeof userValue === 'string') hyb[field].user = userValue;
       await pool.request().input('id', id).input('hyb', JSON.stringify(hyb))
         .query('UPDATE dbo.MC_Entries SET HybridJson=@hyb, UpdatedAt=GETDATE() WHERE Id=@id');
-      res.json({ ok: true });
+      if (typeof userValue === 'string') await audit(pool, currentUser(req).loginId, 'Field edited (Page 1)', `${row.NfaNo} — ${field}`);
+      const updated = await getEntryRow(pool, id);
+      res.json({ ok: true, entry: rowToEntry(updated) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -506,11 +501,15 @@ module.exports = function entriesRoutes(getPool) {
       const pool = await getPool();
       const row = await getEntryRow(pool, id);
       if (!row) return res.status(404).json({ error: 'Entry not found' });
-      const fields = JSON.parse(row.FieldsJson || '{}');
+      const fields = parse(row.FieldsJson, {});
+      const touch = parse(row.TouchJson, {});
       fields[field] = value;
-      await pool.request().input('id', id).input('fields', JSON.stringify(fields))
-        .query('UPDATE dbo.MC_Entries SET FieldsJson=@fields, UpdatedAt=GETDATE() WHERE Id=@id');
-      res.json({ ok: true });
+      // Remember the person chose this so a QMS re-pull keeps it (D9).
+      touch[field] = { value, by: currentUser(req).loginId, at: new Date().toISOString() };
+      await pool.request().input('id', id).input('fields', JSON.stringify(fields)).input('touch', JSON.stringify(touch))
+        .query('UPDATE dbo.MC_Entries SET FieldsJson=@fields, TouchJson=@touch, UpdatedAt=GETDATE() WHERE Id=@id');
+      const updated = await getEntryRow(pool, id);
+      res.json({ ok: true, entry: rowToEntry(updated) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -522,7 +521,8 @@ module.exports = function entriesRoutes(getPool) {
       const pool = await getPool();
       await pool.request().input('id', id).input('c', comment)
         .query('UPDATE dbo.MC_Entries SET ResubComment=@c, UpdatedAt=GETDATE() WHERE Id=@id');
-      res.json({ ok: true });
+      const updated = await getEntryRow(pool, id);
+      res.json({ ok: true, entry: rowToEntry(updated) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -538,7 +538,8 @@ module.exports = function entriesRoutes(getPool) {
       files.splice(fileIndex, 1);
       await pool.request().input('id', id).input('files', JSON.stringify(files))
         .query('UPDATE dbo.MC_Entries SET FilesJson=@files, UpdatedAt=GETDATE() WHERE Id=@id');
-      res.json({ ok: true });
+      const updated = await getEntryRow(pool, id);
+      res.json({ ok: true, entry: rowToEntry(updated) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

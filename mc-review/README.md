@@ -14,8 +14,9 @@ contract this app implements.
 ## Stack
 
 - **Backend:** Node.js + Express + SQL Server (`mssql`), same conventions as
-  `backend-userrights` elsewhere in this repo — header-based trust auth
-  (`x-user-role` / `x-user-id`), `.env` config, tables auto-created on boot.
+  `backend-userrights` elsewhere in this repo — real login (bcrypt + JWT),
+  `.env` config, tables auto-created on boot. Serves the built frontend in
+  production (one process, one port).
 - **Frontend:** React 19 + Vite, plain CSS (no component library), styled to
   match the original prototype's look.
 - **PDF output:** generated server-side with `pdfkit` from the locked
@@ -84,25 +85,32 @@ $env:SEED_DATE="2026-07-22"; npm run seed
 
 ## Getting started (dev)
 
-Backend:
-```
-cd backend
-cp .env.example .env     # fill in your SQL Server credentials
+```bash
+cd mc-review/backend
 npm install
-npm start                # listens on :5094, auto-creates tables on first boot
+copy .env.example .env    # point DB_* at your SQL Server, set JWT_SECRET
+node server.js            # :5094 — tables auto-migrate; QMS mirror sync starts
+
+cd ../frontend
+npm install
+npm run dev               # :94, proxies /api to :5094 (dev only)
 ```
 
-Frontend:
-```
-cd frontend
+## Production (single process — no Vite)
+
+```powershell
+cd mc-review\frontend
 npm install
-npm run dev               # listens on :94
+npm run build             # must end with "✓ built"
+cd ..\backend
+npm install
+node server.js            # serves the app AND the API on :5094
 ```
 
-The frontend's dev server proxies nothing — it calls the API directly at
-`VITE_API_BASE` (see `frontend/.env`), falling back at runtime to
-`http://<current-host>:5094/api` when opened from anywhere other than
-localhost (so the same build works via `swdsales.com` in production).
+`server.js` serves `frontend/dist` when it exists (disable with
+`SERVE_FRONTEND=0`). Published PDFs are written to `PDF_DIR` (see
+`.env.example`) and also stored in the database. Full ops notes:
+`docs/mc-portal-v1-5-build-changelog-note.md`.
 
 ## Login
 
@@ -163,7 +171,9 @@ Everything in Workflow Definition v2.5, including the build queue B1–B7:
 
 ## What's simulated / stubbed for now
 
-- **Auth** — header-based trust, matching the existing SmartDesk pattern.
+- **Auth** — bcrypt passwords + 12h JWT; every API route except login
+  requires a Bearer token (including the PDF route — the frontend fetches
+  PDFs as authenticated blobs).
   Real AD/SSO (I4) is a separate IT lane.
 - **QMS attached files** — the live PR/NFA feed (see below) does not expose
   document/attachment data, so `files` stays empty until the QMS
