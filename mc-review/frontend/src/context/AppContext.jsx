@@ -13,6 +13,8 @@ const ROLE_LABEL = {
 export function AppProvider({ children }) {
   const [token, setToken] = useState(localStorage.getItem('mc_token') || null);
   const [user, setUser] = useState(null); // { loginId, displayName, role, mustChangePassword }
+  // Tell the IT Manager usage tracker (index.html) who is signed in
+  useEffect(() => { window.ITM_USER = user ? (user.loginId || user.displayName || '') : ''; }, [user]);
   const [authLoading, setAuthLoading] = useState(true);
   const [reference, setReference] = useState(null);
 
